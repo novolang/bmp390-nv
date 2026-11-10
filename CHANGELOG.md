@@ -29,5 +29,6 @@ an I2C or an SPI bus.
   suite's vectors come from a separate transcription of its C code.
 - The device program builds for the nRF52840 DK and the nRF54LM20 DK, whose
   board packages answer for I2C and SPI as absent hardware: on those images
-  `begin` answers `false` until the boards drive the buses.
+  `begin` answers `false` until the boards drive the buses.  The gap is tracked by
+  `features/embedded-devex/nordic-twim-i2c-driver.md`.
 - The FIFO and the sensor time are not implemented: the traits name none.
