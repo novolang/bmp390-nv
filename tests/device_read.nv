@@ -1,0 +1,51 @@
+// device_read — a reading loop for a BMP390 on a breakout, for an nRF52840
+// DK or an nRF54LM20 DK.
+//
+// The breakout's SDA and SCL go to the board's I2C pins and its SDO pin to
+// ground, which puts the part at 0x76; INT goes to a free GPIO, if the
+// program is to read the data-ready line.  The program brings the part up,
+// reads the trimming coefficients once, and once a second starts a forced
+// measurement, waits the time the part gives, and prints one line over
+// RTT:
+//
+//     bmp390 mC=<millidegrees> mPa=<millipascals>
+//
+// At sea level the pressure is about 101 325 000 mPa.
+//
+// Build it with `novo build --target=nrf52840-dk tests/device_read.nv` or
+// `novo build --target=nrf54lm20-dk tests/device_read.nv`.
+
+use embedded_hal.{ BoardI2c, BoardGpio }
+use dev_bus
+use dev_baro.{ Barometer }
+use bmp390
+use bmp390.{ Bmp390 }
+
+// The part's address with SDO low.
+const ADDR = 0x76
+
+// A label and a number, written without building a string.
+fn field(label: Str, v: Int) [hw]
+    hal.uart.write(label)
+    hal.uart.write(str.from_int(v))
+
+@tier(embedded)
+fn main() [hw]
+    let part = Bmp390.attach(BoardI2c { id: 0 }, BoardGpio { id: 0 }, dev_bus.wiring_i2c(0, ADDR))
+    if not part.begin()
+        hal.uart.write("bmp390: no answer\n")
+        return
+    let Some(cal) = part.calibration() else return
+    loop
+        let us = part.baro_start()
+        if us >= 0
+            hal.timer.delay_us(us)
+            match part.sample_with(cal)
+                Some(s) =>
+                    hal.uart.write("bmp390")
+                    field(" mC=", s.milli_c)
+                    field(" mPa=", s.milli_pa)
+                    hal.uart.write("\n")
+                None =>
+                    hal.uart.write("bmp390: no result\n")
+        hal.timer.delay_ms(1000)

@@ -1,0 +1,1138 @@
+// bmp390_tests — the driver over a double of the part: a register file
+// that answers on an I2C bus and on an SPI bus the way Bosch's data sheet
+// (BST-BMP390-DS002-07 Rev 1.7, §§ 4 and 5) says a BMP390 does, with its
+// clear-on-read registers, its forced measurement that returns to sleep,
+// its configuration error and its dummy byte on an SPI read, so the
+// framing, the compensation, the settings and the bring-up are checked on
+// the host, one transaction at a time.  The log keeps what the
+// controller sent, in a form the tests compare.
+//
+// Log entries: an I2C write is 1, the address, the bytes sent, -1; an I2C
+// read is 2, the address, the register, the count, -1; an SPI transaction
+// is 3, the bytes the controller clocked out, -1.
+//
+// The compensation is checked against vectors computed by a separate
+// transcription of the data sheet's appendix 8.4 to 8.6 (the C code, in
+// binary64).  The data sheet gives the formulas and no numeric example.
+
+use std.test
+use embedded_hal.{ BoardI2c, BoardSpi, BoardGpio, I2cBus, SpiBus, GpioOut }
+use dev_bus.{ DeviceWiring, DevBytes }
+use dev_baro.{ Pascals, Barometer }
+use dev_thermo.{ TempMilliC, Thermometer }
+use dev_id.{ DeviceId, Identifiable }
+use bmp390
+use bmp390.{ Bmp390, Bmp390Spi, Bmp390Cal, Bmp390Sample, Bmp390Port }
+
+// ── The double ───────────────────────────────────────────────────────
+//
+// `regs` is the part's registers.  `st` is the double's state: 0 is 0
+// before an SPI control byte and 1 after it, 1 the register, 2 RW, 3 the
+// dummy byte still to come, 4 1 when a part is there, 9 1 inside an SPI
+// transaction, 20 and 21 the SPI clock and mode, 22 the I2C clock, 40 the
+// soft resets seen, 41 1 when a reset never finishes, 50 and 51 the raw
+// pressure and temperature a measurement produces, 52 the forced
+// measurements made, 99 the entries in the log.  `ro` lists registers that
+// ignore a write.  Everything is kept in maps, which a method changes
+// through its receiver.
+
+struct Chip
+    regs: HashMap<Int, Int>
+    st: HashMap<Int, Int>
+    ro: HashMap<Int, Int>
+    log: HashMap<Int, Int>
+
+fn at(m: HashMap<Int, Int>, k: Int) -> Int
+    m.get(k) ?? 0
+
+// The chip with CHIP_ID, REV_ID and the reset values in place (Table 25).
+fn chip() -> Chip
+    let c = Chip { regs: HashMap.new(), st: HashMap.new(), ro: HashMap.new(), log: HashMap.new() }
+    c.regs.insert(0x00, 0x60)
+    c.regs.insert(0x01, 0x01)
+    c.regs.insert(0x19, 0x02)
+    c.regs.insert(0x1C, 0x02)
+    c.regs.insert(0x10, 0x01)
+    c.st.insert(4, 1)
+    c
+
+// Appends a value to the log.
+fn log_push(c: Chip, v: Int)
+    let n = at(c.st, 99)
+    c.log.insert(n, v)
+    c.st.insert(99, n + 1)
+
+// Empties the log.
+fn log_clear(c: Chip)
+    c.st.insert(99, 0)
+
+// The conversion time the part takes, typical, for the OSR byte, in
+// microseconds (§ 3.9.2).
+fn typ_us(osr: Int) -> Int
+    234 + 392 + (1 << (osr & 7)) * 2020 + 163 + (1 << ((osr >> 3) & 7)) * 2020
+
+// A write of PWR_CTRL: a forced measurement is made at once and the mode
+// returns to sleep; in normal mode an ODR period shorter than the
+// conversion time sets conf_err.
+fn pwr_write(c: Chip, v: Int)
+    let mode = (v >> 4) & 3
+    var stored = v
+    if mode == 1 or mode == 2
+        stored = v & 0xCF
+        if (v & 3) == 3
+            let p = at(c.st, 50)
+            let t = at(c.st, 51)
+            c.regs.insert(0x04, p & 0xFF)
+            c.regs.insert(0x05, (p >> 8) & 0xFF)
+            c.regs.insert(0x06, (p >> 16) & 0xFF)
+            c.regs.insert(0x07, t & 0xFF)
+            c.regs.insert(0x08, (t >> 8) & 0xFF)
+            c.regs.insert(0x09, (t >> 16) & 0xFF)
+            c.regs.insert(0x03, 0x60)
+            c.regs.insert(0x11, 0x08)
+            c.st.insert(52, at(c.st, 52) + 1)
+    if mode == 3
+        let period = 5000 << (at(c.regs, 0x1D) & 0x1F)
+        if period < typ_us(at(c.regs, 0x1C))
+            c.regs.insert(0x02, at(c.regs, 0x02) | 4)
+    c.regs.insert(0x1B, stored)
+
+// A soft reset: the configuration returns to its reset values and
+// por_detected is set, unless the double is set to never finish.
+fn soft_reset(c: Chip)
+    c.st.insert(40, at(c.st, 40) + 1)
+    c.regs.insert(0x1B, 0x00)
+    c.regs.insert(0x1C, 0x02)
+    c.regs.insert(0x1D, 0x00)
+    c.regs.insert(0x1F, 0x00)
+    c.regs.insert(0x19, 0x02)
+    if at(c.st, 41) == 0
+        c.regs.insert(0x10, 0x01)
+
+// A register as the part answers it: ERR_REG, EVENT and INT_STATUS clear
+// on read, and reading a data register clears the data-ready flags.
+fn chip_read(c: Chip, reg: Int) -> Int
+    let v = at(c.regs, reg)
+    if reg == 0x02 or reg == 0x10 or reg == 0x11
+        c.regs.insert(reg, 0)
+    if reg >= 0x04 and reg <= 0x09
+        c.regs.insert(0x03, 0)
+    v
+
+// A write to a register, which a read-only one ignores.
+fn chip_write(c: Chip, reg: Int, v: Int)
+    if at(c.ro, reg) == 1
+        return
+    if reg == 0x7E and v == 0xB6
+        soft_reset(c)
+        return
+    if reg == 0x1B
+        pwr_write(c, v & 0xFF)
+        return
+    c.regs.insert(reg, v & 0xFF)
+
+struct FakeI2c
+    c: Chip
+
+impl I2cBus for FakeI2c
+    fn init(self, freq: Int) [hw]
+        self.c.st.insert(22, freq)
+
+    fn write(self, addr: Int, data: [u8]) -> Bool [hw]
+        log_push(self.c, 1)
+        log_push(self.c, addr)
+        for b in data
+            log_push(self.c, b as Int)
+        log_push(self.c, -1)
+        if addr != 0x76 or at(self.c.st, 4) == 0 or data.len() < 2
+            return false
+        var r = data[0] as Int
+        for i in 1..data.len()
+            chip_write(self.c, r, data[i] as Int)
+            r = r + 1
+        true
+
+    fn read(self, addr: Int, n: Int) -> ?[u8] [hw]
+        None
+
+    fn write_read(self, addr: Int, tx: [u8], n: Int) -> ?[u8] [hw]
+        log_push(self.c, 2)
+        log_push(self.c, addr)
+        log_push(self.c, tx[0] as Int)
+        log_push(self.c, n)
+        log_push(self.c, -1)
+        if addr != 0x76 or at(self.c.st, 4) == 0
+            return None
+        var r = tx[0] as Int
+        var out: [u8] = []
+        for _i in 0..n
+            list.push(out, chip_read(self.c, r) as u8)
+            r = r + 1
+        Some(out)
+
+struct FakeSpi
+    c: Chip
+
+impl SpiBus for FakeSpi
+    fn init(self, freq: Int, mode: Int) [hw]
+        self.c.st.insert(20, freq)
+        self.c.st.insert(21, mode)
+
+    fn transfer(self, b: Int) -> Int [hw]
+        if at(self.c.st, 9) == 1
+            log_push(self.c, b)
+        if at(self.c.st, 4) == 0
+            return 0xFF
+        if at(self.c.st, 0) == 0
+            self.c.st.insert(0, 1)
+            self.c.st.insert(1, b & 0x7F)
+            self.c.st.insert(2, (b >> 7) & 1)
+            self.c.st.insert(3, (b >> 7) & 1)
+            return 0xFF
+        let r = at(self.c.st, 1)
+        if at(self.c.st, 2) == 1
+            // A read sends one dummy byte first (§ 5.3.2).
+            if at(self.c.st, 3) == 1
+                self.c.st.insert(3, 0)
+                return 0xEE
+            self.c.st.insert(1, (r + 1) & 0x7F)
+            return chip_read(self.c, r)
+        chip_write(self.c, r, b)
+        self.c.st.insert(1, (r + 1) & 0x7F)
+        0xFF
+
+    fn write(self, data: [u8]) [hw]
+        for b in data
+            let _ = self.transfer(b as Int)
+
+    fn read(self, n: Int) -> [u8] [hw]
+        var out: [u8] = []
+        for _i in 0..n
+            list.push(out, self.transfer(0xFF) as u8)
+        out
+
+// The GPIO double: the chip select (pin 67) falling starts an SPI
+// transaction and rising ends it.
+struct FakePins
+    c: Chip
+    levels: HashMap<Int, Int>
+    modes: HashMap<Int, Int>
+
+impl GpioOut for FakePins
+    fn mode(self, pin: Int, dir: Int) [hw]
+        self.modes.insert(pin, dir)
+
+    fn set(self, pin: Int, val: Int) [hw]
+        self.levels.insert(pin, val)
+        if pin == 67 and val == 0
+            self.c.st.insert(0, 0)
+            self.c.st.insert(9, 1)
+            log_push(self.c, 3)
+        if pin == 67 and val == 1 and at(self.c.st, 9) == 1
+            self.c.st.insert(9, 0)
+            log_push(self.c, -1)
+
+    fn get(self, pin: Int) -> Int [hw]
+        at(self.levels, pin)
+
+fn pins(c: Chip) -> FakePins
+    FakePins { c: c, levels: HashMap.new(), modes: HashMap.new() }
+
+// The two ports, as a type that holds a bus implements them: every method
+// is the package's own function over the double.
+struct I2cDut
+    bus: FakeI2c
+    pins: FakePins
+    w: DeviceWiring
+
+impl Bmp390Port for I2cDut
+    fn setup(self) -> Bool [hw]
+        bmp390.i2c_setup(self.bus, self.pins, self.w)
+
+    fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+        bmp390.i2c_read_into(self.bus, self.w, reg, n, var dst)
+
+    fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
+        bmp390.i2c_write(self.bus, self.w, reg, v)
+
+    fn irq_level(self) -> Int [hw]
+        bmp390.irq_level_of(self.pins, self.w)
+
+struct SpiDut
+    bus: FakeSpi
+    pins: FakePins
+    w: DeviceWiring
+
+impl Bmp390Port for SpiDut
+    fn setup(self) -> Bool [hw]
+        bmp390.spi_setup(self.bus, self.pins, self.w)
+
+    fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+        bmp390.spi_read_into(self.bus, self.pins, self.w, reg, n, var dst)
+
+    fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
+        bmp390.spi_write(self.bus, self.pins, self.w, reg, v)
+
+    fn irq_level(self) -> Int [hw]
+        bmp390.irq_level_of(self.pins, self.w)
+
+// The board's wiring: the part at 0x76 on I2C, INT on pin 65.
+fn i2c_wiring() -> DeviceWiring
+    dev_bus.wiring_irq(dev_bus.wiring_i2c(0, 0x76), 65)
+
+// The part on SPI: chip select on pin 67, INT on pin 65.
+fn spi_wiring() -> DeviceWiring
+    dev_bus.wiring_irq(dev_bus.wiring_spi(0, 67), 65)
+
+fn i2c_dut(c: Chip) -> I2cDut
+    I2cDut { bus: FakeI2c { c: c }, pins: pins(c), w: i2c_wiring() }
+
+fn spi_dut(c: Chip) -> SpiDut
+    SpiDut { bus: FakeSpi { c: c }, pins: pins(c), w: spi_wiring() }
+
+// Asserts the log holds exactly `want`, then empties it.
+fn log_is(c: Chip, want: [Int])
+    test.assert_eq(at(c.st, 99), want.len())
+    for i in 0..want.len()
+        test.assert_eq(at(c.log, i), want[i])
+    log_clear(c)
+
+fn reg_of(c: Chip, r: Int) -> Int
+    at(c.regs, r)
+
+// The log of an SPI read: the control byte, then `n` bytes of 0xFF, which
+// is what the controller clocks out while it reads.
+fn spi_read_log(cmd: Int, n: Int) -> [Int]
+    var out: [Int] = [3, cmd]
+    for _i in 0..n
+        list.push(out, 0xFF)
+    list.push(out, -1)
+    out
+
+// ── The trimming coefficients and the vectors ────────────────────────
+//
+// Table 24 lists the 21 bytes from 0x31: NVM_PAR_T1 (16 bits, unsigned),
+// T2 (16, unsigned), T3 (8, signed), P1 (16, signed), P2 (16, signed), P3
+// (8), P4 (8), P5 (16, unsigned), P6 (16, unsigned), P7 (8), P8 (8), P9
+// (16, signed), P10 (8) and P11 (8).  A set is built from the numbers.
+
+fn put8(c: Chip, reg: Int, v: Int)
+    c.regs.insert(reg, v & 0xFF)
+
+fn put16(c: Chip, reg: Int, v: Int)
+    c.regs.insert(reg, v & 0xFF)
+    c.regs.insert(reg + 1, (v >> 8) & 0xFF)
+
+// Set A: values of the magnitude a part has, which give 24.93 degrees and
+// 101.32 kPa at the raw counts 8 453 000 and 6 700 000.
+fn cal_a(c: Chip)
+    put16(c, 0x31, 27500)
+    put16(c, 0x33, 19000)
+    put8(c, 0x35, -10)
+    put16(c, 0x36, 29000)
+    put16(c, 0x38, 17000)
+    put8(c, 0x3A, -5)
+    put8(c, 0x3B, 3)
+    put16(c, 0x3C, 1483)
+    put16(c, 0x3E, 19500)
+    put8(c, 0x40, -11)
+    put8(c, 0x41, -14)
+    put16(c, 0x42, 7400)
+    put8(c, 0x44, -9)
+    put8(c, 0x45, -6)
+
+// Set B: the unsigned coefficients above 32767, and the signed ones
+// negative, which a reading with the wrong signedness gets wrong.
+fn cal_b(c: Chip)
+    put16(c, 0x31, 40000)
+    put16(c, 0x33, 50000)
+    put8(c, 0x35, -100)
+    put16(c, 0x36, -2)
+    put16(c, 0x38, -300)
+    put8(c, 0x3A, 7)
+    put8(c, 0x3B, -8)
+    put16(c, 0x3C, 40000)
+    put16(c, 0x3E, 60000)
+    put8(c, 0x40, 100)
+    put8(c, 0x41, -100)
+    put16(c, 0x42, -1000)
+    put8(c, 0x44, 20)
+    put8(c, 0x45, -128)
+
+fn cal_of_chip(c: Chip) -> Bmp390Cal
+    match bmp390.cal_read(i2c_dut(c))
+        Some(k) => k
+        None => Bmp390Cal { t1: 0.0, t2: 0.0, t3: 0.0, p1: 0.0, p2: 0.0, p3: 0.0, p4: 0.0, p5: 0.0, p6: 0.0, p7: 0.0, p8: 0.0, p9: 0.0, p10: 0.0, p11: 0.0 }
+
+// Whether `a` is within a relative 1e-12 of `b`, or equal when `b` is 0.
+fn near(a: Float, b: Float) -> Bool
+    var d = a - b
+    if d < 0.0
+        d = 0.0 - d
+    var m = b
+    if m < 0.0
+        m = 0.0 - m
+    if m == 0.0
+        return d == 0.0
+    d / m < 1.0e-12
+
+// Sets the raw counts the next forced measurement produces.
+fn set_raw(c: Chip, raw_p: Int, raw_t: Int)
+    c.st.insert(50, raw_p)
+    c.st.insert(51, raw_t)
+
+fn sample_of(o: ?Bmp390Sample) -> Bmp390Sample
+    match o
+        Some(s) => s
+        None => Bmp390Sample { milli_c: -999999999, milli_pa: -999999999 }
+
+// ── The coefficients ─────────────────────────────────────────────────
+
+@test
+fn test_the_coefficients_are_the_nvm_values_over_the_data_sheets_powers_of_two() [io, hw]
+    let c = chip()
+    cal_a(c)
+    let k = cal_of_chip(c)
+    test.assert(k.t1 == 7040000.0)
+    test.assert(near(k.t2, 1.7695128917694092e-05))
+    test.assert(near(k.t3, -3.552713678800501e-14))
+    test.assert(near(k.p1, 0.01203155517578125))
+    test.assert(near(k.p2, 1.1473894119262695e-06))
+    test.assert(near(k.p3, -1.1641532182693481e-09))
+    test.assert(near(k.p4, 2.1827872842550278e-11))
+    test.assert(k.p5 == 11864.0)
+    test.assert(k.p6 == 304.6875)
+    test.assert(k.p7 == -0.04296875)
+    test.assert(k.p8 == -0.00042724609375)
+    test.assert(near(k.p9, 2.6290081223123707e-11))
+    test.assert(near(k.p10, -3.197442310920451e-14))
+    test.assert(near(k.p11, -1.6263032587282567e-19))
+
+@test
+fn test_the_signedness_of_each_coefficient_is_table_24s() [io, hw]
+    let c = chip()
+    cal_b(c)
+    let k = cal_of_chip(c)
+    // T1, T2, P5 and P6 are unsigned: values above 32767 stay positive.
+    test.assert(k.t1 == 10240000.0)
+    test.assert(near(k.t2, 4.6566128730773926e-05))
+    test.assert(k.p5 == 320000.0)
+    test.assert(k.p6 == 937.5)
+    // The others are signed: -2 and -300 are not 65534 and 65236.
+    test.assert(near(k.t3, -3.552713678800501e-13))
+    test.assert(near(k.p1, -0.015626907348632812))
+    test.assert(near(k.p2, -3.107637166976929e-05))
+    test.assert(near(k.p3, 1.6298145055770874e-09))
+    test.assert(near(k.p4, -5.820766091346741e-11))
+    test.assert(k.p7 == 0.390625)
+    test.assert(k.p8 == -0.0030517578125)
+    test.assert(near(k.p9, -3.552713678800501e-12))
+    test.assert(near(k.p10, 7.105427357601002e-14))
+    test.assert(near(k.p11, -3.469446951953614e-18))
+
+@test
+fn test_the_coefficients_decode_from_a_buffer_of_bytes() [io, hw]
+    // T1 = 0x0100 is 256, so 65536 after the scaling; P1 = 0x4000 is 2^14,
+    // so 0 after the offset; P5 = 1 is 8; P11 = -1 is -2^-65.
+    var b: DevBytes = Vec.new()
+    for i in 0..21
+        let _ = b.push(0 as u8)
+    b[0] = 0 as u8
+    b[1] = 1 as u8
+    b[5] = 0 as u8
+    b[6] = 0x40 as u8
+    b[11] = 1 as u8
+    b[20] = 0xFF as u8
+    let k = bmp390.cal_of(b)
+    test.assert(k.t1 == 65536.0)
+    test.assert(k.p1 == 0.0)
+    test.assert(k.p5 == 8.0)
+    test.assert(near(k.p11, -2.710505431213761e-20))
+    test.assert(k.t2 == 0.0)
+
+@test
+fn test_the_calibration_is_one_read_of_21_registers_from_0x31() [io, hw]
+    let c = chip()
+    cal_a(c)
+    let k = bmp390.cal_read(i2c_dut(c))
+    test.assert(k != None)
+    log_is(c, [2, 0x76, 0x31, 21, -1])
+    let s = bmp390.cal_read(spi_dut(c))
+    test.assert(s != None)
+    log_is(c, spi_read_log(0xB1, 22))
+    c.st.insert(4, 0)
+    test.assert(bmp390.cal_read(i2c_dut(c)) == None)
+
+// ── The compensation ─────────────────────────────────────────────────
+
+@test
+fn test_the_temperature_matches_the_data_sheets_formula() [io, hw]
+    let c = chip()
+    cal_a(c)
+    let k = cal_of_chip(c)
+    test.assert(near(bmp390.temperature_c(k, 8453000), 24.93228478073206))
+    test.assert(near(bmp390.temperature_c(k, 8000000), 16.954581951722503))
+    test.assert(near(bmp390.temperature_c(k, 8800000), 31.033378036227077))
+    test.assert(near(bmp390.temperature_c(k, 7000000), -0.7078620001266245))
+    test.assert(near(bmp390.temperature_c(k, 9000000), 34.54597162999562))
+    // Zero at the T1 count.
+    test.assert(bmp390.temperature_c(k, 7040000) == 0.0)
+
+@test
+fn test_the_pressure_matches_the_data_sheets_formula() [io, hw]
+    let c = chip()
+    cal_a(c)
+    let k = cal_of_chip(c)
+    let t = bmp390.temperature_c(k, 8453000)
+    test.assert(near(bmp390.pressure_pa(k, 6700000, t), 101323.1910840512))
+    test.assert(near(bmp390.pressure_pa(k, 6200000, t), 95139.02736882737))
+    let t2 = bmp390.temperature_c(k, 8000000)
+    test.assert(near(bmp390.pressure_pa(k, 6500000, t2), 96388.6772492159))
+    let t3 = bmp390.temperature_c(k, 8800000)
+    test.assert(near(bmp390.pressure_pa(k, 6900000, t3), 105676.52119211644))
+    let t4 = bmp390.temperature_c(k, 7040000)
+    test.assert(near(bmp390.pressure_pa(k, 6600000, t4), 92370.70453006838))
+    // The full range of the counts.
+    let t5 = bmp390.temperature_c(k, 0)
+    test.assert(near(bmp390.pressure_pa(k, 0, t5), -26452.860891229302))
+    let t6 = bmp390.temperature_c(k, 16777215)
+    test.assert(near(bmp390.pressure_pa(k, 16777215, t6), 271477.3718916881))
+
+@test
+fn test_a_set_with_large_unsigned_and_negative_signed_coefficients() [io, hw]
+    let c = chip()
+    cal_b(c)
+    let k = cal_of_chip(c)
+    let t = bmp390.temperature_c(k, 10000000)
+    test.assert(near(t, -11.196334526175633))
+    test.assert(near(bmp390.pressure_pa(k, 6000000, t), 216978.67033612725))
+    let t2 = bmp390.temperature_c(k, 9000000)
+    test.assert(near(t2, -58.28826488141203))
+    test.assert(near(bmp390.pressure_pa(k, 7000000, t2), 169130.03702396987))
+
+@test
+fn test_a_reading_is_rounded_to_a_millidegree_and_a_millipascal() [io, hw]
+    let c = chip()
+    cal_a(c)
+    let k = cal_of_chip(c)
+    set_raw(c, 6700000, 8453000)
+    let d = i2c_dut(c)
+    test.assert_eq(bmp390.convert_start(d), bmp390.conversion_us(0x02))
+    let s = sample_of(bmp390.measure(d, k))
+    test.assert_eq(s.milli_c, 24932)
+    test.assert_eq(s.milli_pa, 101323191)
+    // A negative temperature rounds away from zero: -707.86 is -708.
+    set_raw(c, 6700000, 7000000)
+    let _go = bmp390.convert_start(d)
+    let n = sample_of(bmp390.measure(d, k))
+    test.assert_eq(n.milli_c, -708)
+    test.assert_eq(n.milli_pa, 93386541)
+
+@test
+fn test_the_rounding_helpers() [io, hw]
+    test.assert_eq(bmp390.round_to_int(2.5), 3)
+    test.assert_eq(bmp390.round_to_int(2.4), 2)
+    test.assert_eq(bmp390.round_to_int(-2.5), -3)
+    test.assert_eq(bmp390.round_to_int(-2.4), -2)
+    test.assert_eq(bmp390.pa_of_milli_pa(101323191), 101323)
+    test.assert_eq(bmp390.pa_of_milli_pa(101323500), 101324)
+    test.assert_eq(bmp390.pa_of_milli_pa(-26452861), -26453)
+    test.assert_eq(bmp390.pa_of_milli_pa(0), 0)
+
+// ── The two buses' framing ───────────────────────────────────────────
+
+@test
+fn test_an_i2c_read_is_the_register_then_a_repeated_start_with_no_dummy_byte() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x04, 11)
+    c.regs.insert(0x05, 22)
+    var b: DevBytes = Vec.new()
+    test.assert(d.read_regs(0x04, 2, var b))
+    log_is(c, [2, 0x76, 0x04, 2, -1])
+    test.assert_eq(b[0] as Int, 11)
+    test.assert_eq(b[1] as Int, 22)
+    test.assert_eq(bmp390.reg_read(d, 0x00) ?? -1, 0x60)
+
+@test
+fn test_an_i2c_write_is_the_register_then_the_byte() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert(d.write_reg(0x1D, 0x05))
+    log_is(c, [1, 0x76, 0x1D, 0x05, -1])
+    test.assert_eq(reg_of(c, 0x1D), 0x05)
+    test.assert(bmp390.reg_write(d, 0x1F, 0x06))
+    c.ro.insert(0x1F, 1)
+    test.assert(not bmp390.reg_write(d, 0x1F, 0x08))
+
+@test
+fn test_a_missing_i2c_part_does_not_answer() [io, hw]
+    let c = chip()
+    c.st.insert(4, 0)
+    let d = i2c_dut(c)
+    test.assert(bmp390.reg_read(d, 0x00) == None)
+    test.assert(not d.write_reg(0x1D, 5))
+    test.assert(not bmp390.reg_write(d, 0x1D, 5))
+    test.assert(bmp390.id_read(d) == None)
+
+@test
+fn test_an_spi_read_sets_rw_and_drops_the_dummy_byte() [io, hw]
+    let c = chip()
+    let d = spi_dut(c)
+    c.regs.insert(0x04, 11)
+    c.regs.insert(0x05, 22)
+    var b: DevBytes = Vec.new()
+    test.assert(d.read_regs(0x04, 2, var b))
+    // The control byte, one dummy byte, then the two data bytes.
+    log_is(c, [3, 0x84, 0xFF, 0xFF, 0xFF, -1])
+    test.assert_eq(b.len(), 2)
+    test.assert_eq(b[0] as Int, 11)
+    test.assert_eq(b[1] as Int, 22)
+    test.assert_eq(bmp390.reg_read(d, 0x00) ?? -1, 0x60)
+    test.assert_eq(at(d.pins.levels, 67), 1)
+
+@test
+fn test_an_spi_write_clears_rw() [io, hw]
+    let c = chip()
+    let d = spi_dut(c)
+    test.assert(d.write_reg(0x1D, 0x05))
+    log_is(c, [3, 0x1D, 0x05, -1])
+    test.assert_eq(reg_of(c, 0x1D), 0x05)
+
+@test
+fn test_an_spi_part_that_is_not_there_reads_0xff_and_is_no_part() [io, hw]
+    let c = chip()
+    c.st.insert(4, 0)
+    let d = spi_dut(c)
+    test.assert(bmp390.id_read(d) == None)
+    c.st.insert(4, 1)
+    c.regs.insert(0x00, 0)
+    test.assert(bmp390.id_read(d) == None)
+
+@test
+fn test_a_wiring_with_no_chip_select_runs_no_spi_transaction() [io, hw]
+    let c = chip()
+    let d = SpiDut { bus: FakeSpi { c: c }, pins: pins(c), w: dev_bus.wiring_i2c(0, 0x76) }
+    var b: DevBytes = Vec.new()
+    test.assert(not d.read_regs(0x00, 1, var b))
+    test.assert(not d.write_reg(0x1D, 1))
+    test.assert(not d.setup())
+    test.assert_eq(at(c.st, 99), 0)
+
+@test
+fn test_a_wiring_with_no_address_is_not_an_i2c_part() [io, hw]
+    let c = chip()
+    let d = I2cDut { bus: FakeI2c { c: c }, pins: pins(c), w: dev_bus.wiring_spi(0, 67) }
+    test.assert(not d.setup())
+    test.assert_eq(at(c.st, 99), 0)
+
+// ── Setup and identity ───────────────────────────────────────────────
+
+@test
+fn test_i2c_setup_makes_the_int_pin_an_input_and_the_bus_fast() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert(d.setup())
+    test.assert_eq(at(c.st, 22), 400000)
+    test.assert_eq(at(d.pins.modes, 65), 0)
+
+@test
+fn test_spi_setup_drives_chip_select_high_before_it_is_an_output() [io, hw]
+    let c = chip()
+    let d = spi_dut(c)
+    test.assert(d.setup())
+    test.assert_eq(at(d.pins.levels, 67), 1)
+    test.assert_eq(at(d.pins.modes, 67), 1)
+    test.assert_eq(at(d.pins.modes, 65), 0)
+    test.assert_eq(at(c.st, 20), 4000000)
+    test.assert_eq(at(c.st, 21), 3)
+
+@test
+fn test_the_int_line_level() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    d.pins.levels.insert(65, 1)
+    test.assert_eq(d.irq_level(), 1)
+    test.assert_eq(bmp390.irq_level_of(d.pins, dev_bus.wiring_i2c(0, 0x76)), -1)
+    let s = spi_dut(c)
+    s.pins.levels.insert(65, 1)
+    test.assert_eq(s.irq_level(), 1)
+
+@test
+fn test_the_identity_is_chip_id_with_rev_id_on_both_buses() [io, hw]
+    let c = chip()
+    match bmp390.id_read(i2c_dut(c))
+        Some(id) =>
+            test.assert_eq(id.who, 0x60)
+            test.assert(id.rev == Some(1))
+        None => test.assert(false)
+    match bmp390.id_read(spi_dut(c))
+        Some(id) => test.assert_eq(id.who, 0x60)
+        None     => test.assert(false)
+
+// ── Conversion time and rate ─────────────────────────────────────────
+
+@test
+fn test_the_conversion_time_is_the_formula_plus_a_fifth() [io, hw]
+    // x1 / x1: 234 + 392 + 2020 + 163 + 2020 = 4829 us, plus 20 %.
+    test.assert_eq(bmp390.conversion_us(0x00), 5795)
+    // x4 / x1: 10889 us.
+    test.assert_eq(bmp390.conversion_us(0x02), 13067)
+    // x8 / x1: the formula gives 18969 us, Table 23 prints 18.69 ms.
+    test.assert_eq(bmp390.conversion_us(0x03), 22763)
+    // x32 / x2: 69469 us; Table 23's maximum is 78.09 ms.
+    test.assert_eq(bmp390.conversion_us(0x0D), 83363)
+    test.assert(bmp390.conversion_us(0x0D) > 78090)
+    // Codes above 5 count as 5.
+    test.assert_eq(bmp390.conversion_us(0x3F), bmp390.conversion_us(0x2D))
+    test.assert_eq(bmp390.conversion_us(0x07), bmp390.conversion_us(0x05))
+
+@test
+fn test_every_typical_time_of_table_23_is_covered_by_the_maximum_column() [io, hw]
+    // The maximum times of Table 23 in microseconds, by OSR byte.
+    test.assert(bmp390.conversion_us(0x00) >= 5700)
+    test.assert(bmp390.conversion_us(0x01) >= 7960)
+    test.assert(bmp390.conversion_us(0x02) >= 12480)
+    test.assert(bmp390.conversion_us(0x03) >= 21530)
+    test.assert(bmp390.conversion_us(0x0C) >= 41890)
+    test.assert(bmp390.conversion_us(0x0D) >= 78090)
+
+@test
+fn test_the_odr_period_is_five_milliseconds_times_two_to_the_code() [io, hw]
+    test.assert_eq(bmp390.odr_period_us(0), 5000)
+    test.assert_eq(bmp390.odr_period_us(3), 40000)
+    // Table 45 prints 127 for code 7; the period is 640 ms.
+    test.assert_eq(bmp390.odr_period_us(7), 640000)
+    test.assert_eq(bmp390.odr_period_us(17), 655360000)
+
+@test
+fn test_the_smallest_safe_odr_follows_the_oversampling() [io, hw]
+    test.assert_eq(bmp390.odr_min_sel(0x00), 1)
+    test.assert_eq(bmp390.odr_min_sel(0x03), 3)
+    test.assert_eq(bmp390.odr_min_sel(0x0D), 5)
+    test.assert_eq(bmp390.odr_min_sel(0x02), 2)
+
+// ── Settings ─────────────────────────────────────────────────────────
+
+@test
+fn test_the_oversampling_is_osr_t_over_osr_p() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert(bmp390.osr_write(d, 4, 1))
+    test.assert_eq(reg_of(c, 0x1C), 0x0C)
+    test.assert(bmp390.osr_write(d, 5, 5))
+    test.assert_eq(reg_of(c, 0x1C), 0x2D)
+    test.assert(not bmp390.osr_write(d, 6, 0))
+    test.assert(not bmp390.osr_write(d, 0, 6))
+    test.assert(not bmp390.osr_write(d, -1, 0))
+    test.assert(not bmp390.osr_write(d, 0, -1))
+    test.assert_eq(reg_of(c, 0x1C), 0x2D)
+    c.ro.insert(0x1C, 1)
+    test.assert(not bmp390.osr_write(d, 1, 1))
+
+@test
+fn test_the_iir_filter_code_is_in_bits_3_to_1_of_config() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert(bmp390.iir_write(d, 0))
+    test.assert_eq(reg_of(c, 0x1F), 0x00)
+    test.assert(bmp390.iir_write(d, 3))
+    test.assert_eq(reg_of(c, 0x1F), 0x06)
+    test.assert(bmp390.iir_write(d, 7))
+    test.assert_eq(reg_of(c, 0x1F), 0x0E)
+    test.assert(not bmp390.iir_write(d, 8))
+    test.assert(not bmp390.iir_write(d, -1))
+    c.ro.insert(0x1F, 1)
+    test.assert(not bmp390.iir_write(d, 1))
+
+// ── Measurements ─────────────────────────────────────────────────────
+
+@test
+fn test_a_forced_measurement_writes_the_mode_and_answers_the_time() [io, hw]
+    let c = chip()
+    cal_a(c)
+    set_raw(c, 6700000, 8453000)
+    c.regs.insert(0x1C, 0x03)
+    let d = i2c_dut(c)
+    test.assert_eq(bmp390.convert_start(d), 22763)
+    // PWR_CTRL with both measurements on and mode 01, and the part is
+    // back in sleep when it has finished.
+    log_is(c, [2, 0x76, 0x1B, 2, -1, 1, 0x76, 0x1B, 0x13, -1])
+    test.assert_eq(reg_of(c, 0x1B), 0x03)
+    test.assert_eq(at(c.st, 52), 1)
+    test.assert(bmp390.data_ready(d))
+    let s = sample_of(bmp390.sample_read(d))
+    test.assert_eq(s.milli_c, 24932)
+    test.assert(not bmp390.data_ready(d))
+
+@test
+fn test_a_part_in_normal_mode_converts_by_itself_and_start_writes_nothing() [io, hw]
+    let c = chip()
+    c.regs.insert(0x1B, 0x33)
+    let d = i2c_dut(c)
+    test.assert_eq(bmp390.convert_start(d), 0)
+    log_is(c, [2, 0x76, 0x1B, 2, -1])
+    c.st.insert(4, 0)
+    test.assert_eq(bmp390.convert_start(d), -1)
+
+@test
+fn test_a_forced_measurement_the_part_does_not_acknowledge_answers_minus_one() [io, hw]
+    let c = chip()
+    let g = NoPwrWrite { inner: i2c_dut(c) }
+    test.assert_eq(bmp390.convert_start(g), -1)
+
+// A port that does not acknowledge a write to PWR_CTRL, over another
+// port.
+struct NoPwrWrite
+    inner: I2cDut
+
+impl Bmp390Port for NoPwrWrite
+    fn setup(self) -> Bool [hw]
+        self.inner.setup()
+
+    fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+        self.inner.read_regs(reg, n, var dst)
+
+    fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
+        if reg == 0x1B
+            return false
+        self.inner.write_reg(reg, v)
+
+    fn irq_level(self) -> Int [hw]
+        self.inner.irq_level()
+
+@test
+fn test_a_result_before_any_measurement_is_none() [io, hw]
+    let c = chip()
+    cal_a(c)
+    // The data registers read 0x800000 until a measurement is made.
+    c.regs.insert(0x06, 0x80)
+    test.assert(bmp390.sample_read(i2c_dut(c)) == None)
+    c.st.insert(4, 0)
+    test.assert(bmp390.measure(i2c_dut(c), cal_of_chip(c)) == None)
+
+@test
+fn test_both_counts_come_from_one_burst_of_the_six_data_registers() [io, hw]
+    let c = chip()
+    cal_a(c)
+    set_raw(c, 6700000, 8453000)
+    let d = i2c_dut(c)
+    let _go = bmp390.convert_start(d)
+    log_clear(c)
+    let k = cal_of_chip(c)
+    log_clear(c)
+    let s = bmp390.measure(d, k)
+    test.assert(s != None)
+    log_is(c, [2, 0x76, 0x04, 6, -1])
+    let t = bmp390.measure(spi_dut(c), k)
+    test.assert(t != None)
+    // The control byte, the dummy byte and the six data bytes.
+    log_is(c, spi_read_log(0x84, 7))
+
+@test
+fn test_normal_mode_clamps_the_rate_to_what_the_oversampling_allows() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    // x8 / x1 needs odr_sel 3 or more: 0 is raised to 3.
+    c.regs.insert(0x1C, 0x03)
+    test.assert(bmp390.normal_start(d, 0))
+    test.assert_eq(reg_of(c, 0x1D), 3)
+    test.assert_eq(reg_of(c, 0x1B), 0x33)
+    // A request above the table is held to 17.
+    test.assert(bmp390.normal_start(d, 99))
+    test.assert_eq(reg_of(c, 0x1D), 17)
+    test.assert(bmp390.normal_start(d, 5))
+    test.assert_eq(reg_of(c, 0x1D), 5)
+
+@test
+fn test_a_configuration_error_is_reported_and_clears_on_read() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    // An ODR period shorter than the conversion: written without the
+    // clamp, the part sets conf_err.
+    c.regs.insert(0x1C, 0x03)
+    c.regs.insert(0x1D, 0x00)
+    test.assert(d.write_reg(0x1B, 0x33))
+    test.assert_eq(bmp390.err_read(d), 4)
+    test.assert_eq(bmp390.err_read(d), 0)
+    // A fatal or command error fails the start of normal mode.
+    c.regs.insert(0x02, 0x01)
+    test.assert(not bmp390.normal_start(d, 3))
+    c.regs.insert(0x02, 0x02)
+    test.assert(not bmp390.normal_start(d, 3))
+
+@test
+fn test_normal_start_fails_on_a_silent_or_stubborn_part() [io, hw]
+    let c = chip()
+    c.ro.insert(0x1D, 1)
+    c.regs.insert(0x1D, 0x07)
+    test.assert(not bmp390.normal_start(i2c_dut(c), 5))
+    let e = chip()
+    test.assert(not bmp390.normal_start(NoPwrWrite { inner: i2c_dut(e) }, 5))
+    let f = chip()
+    f.st.insert(4, 0)
+    test.assert(not bmp390.normal_start(i2c_dut(f), 5))
+
+@test
+fn test_sleep_keeps_both_measurements_enabled() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x1B, 0x33)
+    test.assert(bmp390.sleep_mode(d))
+    test.assert_eq(reg_of(c, 0x1B), 0x03)
+    c.st.insert(4, 0)
+    test.assert(not bmp390.sleep_mode(d))
+
+@test
+fn test_the_interrupt_status_and_the_ready_flags_clear_on_read() [io, hw]
+    let c = chip()
+    cal_a(c)
+    set_raw(c, 6700000, 8453000)
+    let d = i2c_dut(c)
+    let _go = bmp390.convert_start(d)
+    test.assert_eq(bmp390.irq_clear(d), 0x08)
+    test.assert_eq(bmp390.irq_clear(d), 0)
+    c.st.insert(4, 0)
+    test.assert_eq(bmp390.irq_clear(d), -1)
+    test.assert_eq(bmp390.err_read(d), -1)
+    test.assert(not bmp390.data_ready(d))
+
+// ── Bring-up ─────────────────────────────────────────────────────────
+
+@test
+fn test_the_bring_up_resets_the_part_and_writes_its_settings_on_i2c() [io, hw]
+    let c = chip()
+    cal_a(c)
+    // A part left in normal mode with other settings by a previous run.
+    c.regs.insert(0x1B, 0x33)
+    c.regs.insert(0x1C, 0x2D)
+    c.regs.insert(0x1D, 0x01)
+    c.regs.insert(0x1F, 0x0E)
+    let d = i2c_dut(c)
+    test.assert(bmp390.start(d))
+    test.assert_eq(at(c.st, 40), 1)
+    test.assert_eq(reg_of(c, 0x1B), 0x03)
+    test.assert_eq(reg_of(c, 0x1C), 0x03)
+    test.assert_eq(reg_of(c, 0x1D), 0x03)
+    test.assert_eq(reg_of(c, 0x1F), 0x00)
+    test.assert_eq(reg_of(c, 0x19), 0x46)
+    test.assert_eq(at(c.st, 22), 400000)
+
+@test
+fn test_the_bring_up_checks_the_chip_id_before_it_resets() [io, hw]
+    let c = chip()
+    cal_a(c)
+    let d = i2c_dut(c)
+    test.assert(bmp390.start(d))
+    // CHIP_ID, then EVENT read, then the soft reset command 0xB6 to CMD.
+    test.assert_eq(at(c.log, 2), 0x00)
+    test.assert_eq(at(c.log, 7), 0x10)
+    test.assert_eq(at(c.log, 10), 1)
+    test.assert_eq(at(c.log, 12), 0x7E)
+    test.assert_eq(at(c.log, 13), 0xB6)
+
+@test
+fn test_the_bring_up_over_spi_runs_the_same_settings() [io, hw]
+    let c = chip()
+    cal_a(c)
+    let d = spi_dut(c)
+    test.assert(bmp390.start(d))
+    test.assert_eq(reg_of(c, 0x1C), 0x03)
+    test.assert_eq(reg_of(c, 0x19), 0x46)
+    test.assert_eq(at(c.st, 21), 3)
+
+@test
+fn test_a_bmp388_or_another_part_is_refused() [io, hw]
+    let c = chip()
+    c.regs.insert(0x00, 0x50)
+    test.assert(not bmp390.start(i2c_dut(c)))
+    test.assert_eq(at(c.st, 40), 0)
+    let e = chip()
+    e.st.insert(4, 0)
+    test.assert(not bmp390.start(spi_dut(e)))
+    // A wiring the bus cannot use.
+    let f = chip()
+    test.assert(not bmp390.start(SpiDut { bus: FakeSpi { c: f }, pins: pins(f), w: dev_bus.wiring_i2c(0, 0x76) }))
+
+@test
+fn test_a_reset_that_never_finishes_ends_the_bring_up() [io, hw]
+    let c = chip()
+    cal_a(c)
+    c.st.insert(41, 1)
+    test.assert(not bmp390.start(i2c_dut(c)))
+    test.assert_eq(at(c.st, 40), 1)
+
+@test
+fn test_a_part_that_refuses_the_soft_reset_ends_the_bring_up() [io, hw]
+    let c = chip()
+    c.ro.insert(0x7E, 1)
+    c.st.insert(41, 1)
+    test.assert(not bmp390.start(i2c_dut(c)))
+    let e = chip()
+    let g = FailCmd { inner: i2c_dut(e) }
+    test.assert(not bmp390.start(g))
+
+// A port that does not acknowledge a write to CMD, over another port.
+struct FailCmd
+    inner: I2cDut
+
+impl Bmp390Port for FailCmd
+    fn setup(self) -> Bool [hw]
+        self.inner.setup()
+
+    fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+        self.inner.read_regs(reg, n, var dst)
+
+    fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
+        if reg == 0x7E
+            return false
+        self.inner.write_reg(reg, v)
+
+    fn irq_level(self) -> Int [hw]
+        self.inner.irq_level()
+
+@test
+fn test_a_fatal_error_after_the_reset_ends_the_bring_up() [io, hw]
+    let c = chip()
+    cal_a(c)
+    let g = ErrAfterReset { inner: i2c_dut(c) }
+    test.assert(not bmp390.start(g))
+
+// A port that leaves a fatal error in ERR_REG when CMD is written, over
+// another port.
+struct ErrAfterReset
+    inner: I2cDut
+
+impl Bmp390Port for ErrAfterReset
+    fn setup(self) -> Bool [hw]
+        self.inner.setup()
+
+    fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+        self.inner.read_regs(reg, n, var dst)
+
+    fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
+        let ok = self.inner.write_reg(reg, v)
+        if reg == 0x7E
+            self.inner.bus.c.regs.insert(0x02, 0x01)
+        ok
+
+    fn irq_level(self) -> Int [hw]
+        self.inner.irq_level()
+
+@test
+fn test_a_part_that_refuses_a_setting_is_reported() [io, hw]
+    let c = chip()
+    cal_a(c)
+    c.ro.insert(0x1C, 1)
+    test.assert(not bmp390.start(i2c_dut(c)))
+    let e = chip()
+    cal_a(e)
+    e.ro.insert(0x19, 1)
+    test.assert(not bmp390.start(i2c_dut(e)))
+
+@test
+fn test_a_part_whose_calibration_cannot_be_read_fails_the_bring_up() [io, hw]
+    let c = chip()
+    let g = NoCal { inner: i2c_dut(c) }
+    test.assert(not bmp390.start(g))
+
+// A port that does not answer a read of the calibration, over another
+// port.
+struct NoCal
+    inner: I2cDut
+
+impl Bmp390Port for NoCal
+    fn setup(self) -> Bool [hw]
+        self.inner.setup()
+
+    fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+        if reg == 0x31
+            dst.clear()
+            return false
+        self.inner.read_regs(reg, n, var dst)
+
+    fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
+        self.inner.write_reg(reg, v)
+
+    fn irq_level(self) -> Int [hw]
+        self.inner.irq_level()
+
+// ── The traits over the double ───────────────────────────────────────
+
+@test
+fn test_the_barometer_and_thermometer_read_the_same_forced_measurement() [io, hw]
+    let c = chip()
+    cal_a(c)
+    set_raw(c, 6700000, 8453000)
+    let d = i2c_dut(c)
+    test.assert(bmp390.start(d))
+    let us = bmp390.convert_start(d)
+    test.assert(us > 0)
+    let s = sample_of(bmp390.sample_read(d))
+    test.assert_eq(bmp390.pa_of_milli_pa(s.milli_pa), 101323)
+    test.assert_eq(s.milli_c, 24932)
+    match bmp390.baro_read_of(d)
+        Some(p) => test.assert_eq(p.pa, 101323)
+        None    => test.assert(false)
+    match bmp390.temp_read_of(spi_dut(c))
+        Some(t) => test.assert_eq(t.milli_c, 24932)
+        None    => test.assert(false)
+    c.st.insert(4, 0)
+    test.assert(bmp390.baro_read_of(d) == None)
+    test.assert(bmp390.temp_read_of(d) == None)
+
+// ── The types over the host's board handles ──────────────────────────
+//
+// The host's handles are absent hardware: every transfer is refused, so
+// each method answers its "no part" value.  This runs the lines of the
+// two types that forward to the functions above.
+
+@test
+fn test_the_i2c_type_over_absent_hardware() [io, hw]
+    let w = dev_bus.wiring_i2c(0, 0x76)
+    let p = Bmp390.attach(BoardI2c { id: 0 }, BoardGpio { id: 0 }, w)
+    test.assert(not p.begin())
+    test.assert_eq(p.irq_level(), -1)
+    test.assert(p.reg(0x00) == None)
+    test.assert(not p.set_reg(0x1D, 1))
+    test.assert(p.calibration() == None)
+    let zero = Bmp390Cal { t1: 0.0, t2: 0.0, t3: 0.0, p1: 0.0, p2: 0.0, p3: 0.0, p4: 0.0, p5: 0.0, p6: 0.0, p7: 0.0, p8: 0.0, p9: 0.0, p10: 0.0, p11: 0.0 }
+    test.assert(p.sample_with(zero) == None)
+    test.assert(p.sample() == None)
+    test.assert(not p.ready())
+    test.assert_eq(p.clear_irq(), -1)
+    test.assert_eq(p.errors(), -1)
+    test.assert(not p.set_oversampling(2, 0))
+    test.assert(not p.set_iir(2))
+    test.assert(not p.run_normal(5))
+    test.assert(not p.sleep())
+    test.assert_eq(p.baro_start(), -1)
+    test.assert(p.baro_read() == None)
+    test.assert_eq(p.temp_start(), -1)
+    test.assert(p.temp_read() == None)
+    test.assert(p.device_id() == None)
+
+@test
+fn test_the_spi_type_over_absent_hardware() [io, hw]
+    let w = DeviceWiring { bus: 0, addr: None, cs: None, irq: None, en: None }
+    let p = Bmp390Spi.attach(BoardSpi { id: 0 }, BoardGpio { id: 0 }, w)
+    test.assert(not p.begin())
+    test.assert_eq(p.irq_level(), -1)
+    test.assert(p.reg(0x00) == None)
+    test.assert(not p.set_reg(0x1D, 1))
+    test.assert(p.calibration() == None)
+    let zero = Bmp390Cal { t1: 0.0, t2: 0.0, t3: 0.0, p1: 0.0, p2: 0.0, p3: 0.0, p4: 0.0, p5: 0.0, p6: 0.0, p7: 0.0, p8: 0.0, p9: 0.0, p10: 0.0, p11: 0.0 }
+    test.assert(p.sample_with(zero) == None)
+    test.assert(p.sample() == None)
+    test.assert(not p.ready())
+    test.assert_eq(p.clear_irq(), -1)
+    test.assert_eq(p.errors(), -1)
+    test.assert(not p.set_oversampling(2, 0))
+    test.assert(not p.set_iir(2))
+    test.assert(not p.run_normal(5))
+    test.assert(not p.sleep())
+    test.assert_eq(p.baro_start(), -1)
+    test.assert(p.baro_read() == None)
+    test.assert_eq(p.temp_start(), -1)
+    test.assert(p.temp_read() == None)
+    test.assert(p.device_id() == None)
