@@ -27,8 +27,11 @@ an I2C or an SPI bus.
 - Hardware verification: NOT VERIFIED.  No board carries a BMP390.
 - The data sheet gives no numeric example of the compensation.  The
   suite's vectors come from a separate transcription of its C code.
-- The device program builds for the nRF52840 DK and the nRF54LM20 DK, whose
-  board packages answer for I2C and SPI as absent hardware: on those images
-  `begin` answers `false` until the boards drive the buses.  The gap is tracked by
-  `features/embedded-devex/nordic-twim-i2c-driver.md`.
+- The device program builds for the nRF52840 DK and the nRF54LM20 DK.  Their
+  board packages answered for I2C and SPI as absent hardware when the
+  package was written (images of 12,532 and 13,308 bytes of flash, without
+  the reading path); the TWIM and SPIM drivers, tracked by
+  `features/embedded-devex/nordic-twim-i2c-driver.md`, landed on 2026-11-10,
+  and the images are now 22,980 and 23,988 bytes with the reading path.  A
+  reply from a BMP390 over those buses is NOT VERIFIED until the driver rig.
 - The FIFO and the sensor time are not implemented: the traits name none.
