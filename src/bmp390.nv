@@ -106,20 +106,20 @@ let CALIB_0    = 0x31
 let CMD        = 0x7E
 
 // CHIP_ID's value, and the commands.
-let ID_BMP390 = 0x60
+let ID_BMP390     = 0x60
 let CMD_SOFTRESET = 0xB6
 
 // The SPI control byte's RW bit.
 let SPI_READ = 0x80
 
 // PWR_CTRL: both measurements on, and the modes.
-let PWR_BOTH = 0x03
+let PWR_BOTH    = 0x03
 let MODE_FORCED = 0x10
 let MODE_NORMAL = 0x30
-let MODE_MASK = 0x30
+let MODE_MASK   = 0x30
 // ERR_REG: the fatal and command errors, and the configuration error.
 let ERR_FATAL_CMD = 0x03
-let ERR_CONF = 0x04
+let ERR_CONF      = 0x04
 // STATUS: both data-ready flags.
 let STATUS_DRDY = 0x60
 // EVENT: the power-on reset bit.
@@ -134,17 +134,17 @@ let ODR_DEFAULT = 3
 
 // The largest oversampling code (Table 43) and odr_sel (Table 44), and
 // the period of odr_sel 0.
-let OSR_MAX = 5
-let IIR_MAX = 7
-let ODR_MAX = 17
+let OSR_MAX       = 5
+let IIR_MAX       = 7
+let ODR_MAX       = 17
 let ODR_PERIOD_US = 5000
 
 // The raw value a measurement that was not made reads as.
 let RAW_SKIPPED = 0x800000
 
 // The clocks `setup` asks for: I2C fast mode, and SPI at 4 MHz in mode 3.
-let I2C_HZ = 400000
-let SPI_HZ = 4000000
+let I2C_HZ   = 400000
+let SPI_HZ   = 4000000
 let SPI_MODE = 3
 
 // The most polls of EVENT `start` makes for the reset to finish.
@@ -205,8 +205,8 @@ pub fn i2c_write<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, v: Int) -> Bool [
 // dummy is dropped.  Whether it ran, which is whether the wiring has a
 // chip select.  `n` is at most 31, the room the transaction's buffer
 // leaves for the dummy.
-pub fn spi_read_into<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring, reg: Int,
-                                            n: Int, var dst: DevBytes) -> Bool [hw]
+pub fn spi_read_into<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring, reg: Int, n: Int,
+                                            var dst: DevBytes) -> Bool [hw]
     var tx: DevBytes = Vec.new()
     let _ = tx.push((SPI_READ | (reg & 0x7F)) as u8)
     var raw: DevBytes = Vec.new()
@@ -308,27 +308,27 @@ fn s8_at(b: DevBytes, i: Int) -> Int
 // so the conversion is exact.
 pub fn cal_of(b: DevBytes) -> Bmp390Cal
     Bmp390Cal {
-        t1: (u16_at(b, 0) as Float) * 256.0,
-        t2: (u16_at(b, 2) as Float) / 1073741824.0,
-        t3: (s8_at(b, 4) as Float) / 281474976710656.0,
-        p1: ((s16_at(b, 5) - 16384) as Float) / 1048576.0,
-        p2: ((s16_at(b, 7) - 16384) as Float) / 536870912.0,
-        p3: (s8_at(b, 9) as Float) / 4294967296.0,
-        p4: (s8_at(b, 10) as Float) / 137438953472.0,
-        p5: (u16_at(b, 11) as Float) * 8.0,
-        p6: (u16_at(b, 13) as Float) / 64.0,
-        p7: (s8_at(b, 15) as Float) / 256.0,
-        p8: (s8_at(b, 16) as Float) / 32768.0,
-        p9: (s16_at(b, 17) as Float) / 281474976710656.0,
-        p10: (s8_at(b, 19) as Float) / 281474976710656.0,
-        p11: (s8_at(b, 20) as Float) / 36893488147419103232.0 }
+        t1: u16_at(b, 0) as Float * 256.0,
+        t2: u16_at(b, 2) as Float / 1073741824.0,
+        t3: s8_at(b, 4) as Float / 281474976710656.0,
+        p1: (s16_at(b, 5) - 16384) as Float / 1048576.0,
+        p2: (s16_at(b, 7) - 16384) as Float / 536870912.0,
+        p3: s8_at(b, 9) as Float / 4294967296.0,
+        p4: s8_at(b, 10) as Float / 137438953472.0,
+        p5: u16_at(b, 11) as Float * 8.0,
+        p6: u16_at(b, 13) as Float / 64.0,
+        p7: s8_at(b, 15) as Float / 256.0,
+        p8: s8_at(b, 16) as Float / 32768.0,
+        p9: s16_at(b, 17) as Float / 281474976710656.0,
+        p10: s8_at(b, 19) as Float / 281474976710656.0,
+        p11: s8_at(b, 20) as Float / 36893488147419103232.0 }
 
 // The temperature in degrees Celsius for a raw 24-bit count (§ 8.5).  The
 // result is also the t_lin that `pressure_pa` takes.
 pub fn temperature_c(cal: Bmp390Cal, raw_t: Int) -> Float
-    let d1 = (raw_t as Float) - cal.t1
+    let d1 = raw_t as Float - cal.t1
     let d2 = d1 * cal.t2
-    d2 + (d1 * d1) * cal.t3
+    d2 + d1 * d1 * cal.t3
 
 // The pressure in pascals for a raw 24-bit count and the `t_lin` of the
 // same measurement (§ 8.6).
@@ -345,7 +345,7 @@ pub fn pressure_pa(cal: Bmp390Cal, raw_p: Int, t_lin: Float) -> Float
     let c1 = up * up
     let c2 = cal.p9 + cal.p10 * t_lin
     let c3 = c1 * c2
-    let c4 = c3 + (up * up * up) * cal.p11
+    let c4 = c3 + up * up * up * cal.p11
     out1 + out2 + c4
 
 // `x` rounded to the nearest whole number, halves away from zero.
@@ -478,7 +478,7 @@ pub fn convert_start<P: Bmp390Port>(p: P) -> Int [hw]
     var b: DevBytes = Vec.new()
     if not p.read_regs(PWR_CTRL, 2, var b)
         return -1
-    if ((b[0] as Int) & MODE_MASK) == MODE_NORMAL
+    if (b[0] as Int & MODE_MASK) == MODE_NORMAL
         return 0
     if not p.write_reg(PWR_CTRL, PWR_BOTH | MODE_FORCED)
         return -1

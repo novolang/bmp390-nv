@@ -362,7 +362,20 @@ fn cal_b(c: Chip)
 fn cal_of_chip(c: Chip) -> Bmp390Cal
     match bmp390.cal_read(i2c_dut(c))
         Some(k) => k
-        None => Bmp390Cal { t1: 0.0, t2: 0.0, t3: 0.0, p1: 0.0, p2: 0.0, p3: 0.0, p4: 0.0, p5: 0.0, p6: 0.0, p7: 0.0, p8: 0.0, p9: 0.0, p10: 0.0, p11: 0.0 }
+        None    => Bmp390Cal { t1: 0.0,
+            t2: 0.0,
+            t3: 0.0,
+            p1: 0.0,
+            p2: 0.0,
+            p3: 0.0,
+            p4: 0.0,
+            p5: 0.0,
+            p6: 0.0,
+            p7: 0.0,
+            p8: 0.0,
+            p9: 0.0,
+            p10: 0.0,
+            p11: 0.0 }
 
 // Whether `a` is within a relative 1e-12 of `b`, or equal when `b` is 0.
 fn near(a: Float, b: Float) -> Bool
@@ -384,7 +397,7 @@ fn set_raw(c: Chip, raw_p: Int, raw_t: Int)
 fn sample_of(o: ?Bmp390Sample) -> Bmp390Sample
     match o
         Some(s) => s
-        None => Bmp390Sample { milli_c: -999999999, milli_pa: -999999999 }
+        None    => Bmp390Sample { milli_c: -999999999, milli_pa: -999999999 }
 
 // ── The coefficients ─────────────────────────────────────────────────
 
@@ -665,7 +678,7 @@ fn test_the_identity_is_chip_id_with_rev_id_on_both_buses() [io, hw]
         Some(id) =>
             test.assert_eq(id.who, 0x60)
             test.assert(id.rev == Some(1))
-        None => test.assert(false)
+        None     => test.assert(false)
     match bmp390.id_read(spi_dut(c))
         Some(id) => test.assert_eq(id.who, 0x60)
         None     => test.assert(false)
@@ -1096,7 +1109,20 @@ fn test_the_i2c_type_over_absent_hardware() [io, hw]
     test.assert(p.reg(0x00) == None)
     test.assert(not p.set_reg(0x1D, 1))
     test.assert(p.calibration() == None)
-    let zero = Bmp390Cal { t1: 0.0, t2: 0.0, t3: 0.0, p1: 0.0, p2: 0.0, p3: 0.0, p4: 0.0, p5: 0.0, p6: 0.0, p7: 0.0, p8: 0.0, p9: 0.0, p10: 0.0, p11: 0.0 }
+    let zero = Bmp390Cal { t1: 0.0,
+        t2: 0.0,
+        t3: 0.0,
+        p1: 0.0,
+        p2: 0.0,
+        p3: 0.0,
+        p4: 0.0,
+        p5: 0.0,
+        p6: 0.0,
+        p7: 0.0,
+        p8: 0.0,
+        p9: 0.0,
+        p10: 0.0,
+        p11: 0.0 }
     test.assert(p.sample_with(zero) == None)
     test.assert(p.sample() == None)
     test.assert(not p.ready())
@@ -1121,7 +1147,20 @@ fn test_the_spi_type_over_absent_hardware() [io, hw]
     test.assert(p.reg(0x00) == None)
     test.assert(not p.set_reg(0x1D, 1))
     test.assert(p.calibration() == None)
-    let zero = Bmp390Cal { t1: 0.0, t2: 0.0, t3: 0.0, p1: 0.0, p2: 0.0, p3: 0.0, p4: 0.0, p5: 0.0, p6: 0.0, p7: 0.0, p8: 0.0, p9: 0.0, p10: 0.0, p11: 0.0 }
+    let zero = Bmp390Cal { t1: 0.0,
+        t2: 0.0,
+        t3: 0.0,
+        p1: 0.0,
+        p2: 0.0,
+        p3: 0.0,
+        p4: 0.0,
+        p5: 0.0,
+        p6: 0.0,
+        p7: 0.0,
+        p8: 0.0,
+        p9: 0.0,
+        p10: 0.0,
+        p11: 0.0 }
     test.assert(p.sample_with(zero) == None)
     test.assert(p.sample() == None)
     test.assert(not p.ready())
