@@ -17,7 +17,7 @@
 
 use std.test
 use embedded_hal.{ BoardI2c, BoardSpi, BoardGpio, I2cBus, SpiBus, GpioOut }
-use dev_bus.{ DeviceWiring, DevBytes }
+use dev_bus.{ DeviceWiring, DevBytes, RegPort }
 use dev_baro.{ Pascals, Barometer }
 use dev_thermo.{ TempMilliC, Thermometer }
 use dev_id.{ DeviceId, Identifiable }
@@ -245,15 +245,16 @@ struct I2cDut
     pins: FakePins
     w: DeviceWiring
 
-impl Bmp390Port for I2cDut
-    fn setup(self) -> Bool [hw]
-        bmp390.i2c_setup(self.bus, self.pins, self.w)
-
+impl RegPort for I2cDut
     fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
         bmp390.i2c_read_into(self.bus, self.w, reg, n, var dst)
 
     fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
         bmp390.i2c_write(self.bus, self.w, reg, v)
+
+impl Bmp390Port for I2cDut
+    fn setup(self) -> Bool [hw]
+        bmp390.i2c_setup(self.bus, self.pins, self.w)
 
     fn irq_level(self) -> Int [hw]
         bmp390.irq_level_of(self.pins, self.w)
@@ -263,15 +264,16 @@ struct SpiDut
     pins: FakePins
     w: DeviceWiring
 
-impl Bmp390Port for SpiDut
-    fn setup(self) -> Bool [hw]
-        bmp390.spi_setup(self.bus, self.pins, self.w)
-
+impl RegPort for SpiDut
     fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
         bmp390.spi_read_into(self.bus, self.pins, self.w, reg, n, var dst)
 
     fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
         bmp390.spi_write(self.bus, self.pins, self.w, reg, v)
+
+impl Bmp390Port for SpiDut
+    fn setup(self) -> Bool [hw]
+        bmp390.spi_setup(self.bus, self.pins, self.w)
 
     fn irq_level(self) -> Int [hw]
         bmp390.irq_level_of(self.pins, self.w)
@@ -565,7 +567,7 @@ fn test_an_i2c_read_is_the_register_then_a_repeated_start_with_no_dummy_byte() [
     log_is(c, [2, 0x76, 0x04, 2, -1])
     test.assert_eq(b[0] as Int, 11)
     test.assert_eq(b[1] as Int, 22)
-    test.assert_eq(bmp390.reg_read(d, 0x00) ?? -1, 0x60)
+    test.assert_eq(d.read_reg(0x00) ?? -1, 0x60)
 
 @test
 fn test_an_i2c_write_is_the_register_then_the_byte() [io, hw]
@@ -574,18 +576,18 @@ fn test_an_i2c_write_is_the_register_then_the_byte() [io, hw]
     test.assert(d.write_reg(0x1D, 0x05))
     log_is(c, [1, 0x76, 0x1D, 0x05, -1])
     test.assert_eq(reg_of(c, 0x1D), 0x05)
-    test.assert(bmp390.reg_write(d, 0x1F, 0x06))
+    test.assert(d.write_reg_verified(0x1F, 0x06))
     c.ro.insert(0x1F, 1)
-    test.assert(not bmp390.reg_write(d, 0x1F, 0x08))
+    test.assert(not d.write_reg_verified(0x1F, 0x08))
 
 @test
 fn test_a_missing_i2c_part_does_not_answer() [io, hw]
     let c = chip()
     c.st.insert(4, 0)
     let d = i2c_dut(c)
-    test.assert(bmp390.reg_read(d, 0x00) == None)
+    test.assert(d.read_reg(0x00) == None)
     test.assert(not d.write_reg(0x1D, 5))
-    test.assert(not bmp390.reg_write(d, 0x1D, 5))
+    test.assert(not d.write_reg_verified(0x1D, 5))
     test.assert(bmp390.id_read(d) == None)
 
 @test
@@ -601,7 +603,7 @@ fn test_an_spi_read_sets_rw_and_drops_the_dummy_byte() [io, hw]
     test.assert_eq(b.len(), 2)
     test.assert_eq(b[0] as Int, 11)
     test.assert_eq(b[1] as Int, 22)
-    test.assert_eq(bmp390.reg_read(d, 0x00) ?? -1, 0x60)
+    test.assert_eq(d.read_reg(0x00) ?? -1, 0x60)
     test.assert_eq(at(d.pins.levels, 67), 1)
 
 @test
@@ -799,10 +801,7 @@ fn test_a_forced_measurement_the_part_does_not_acknowledge_answers_minus_one() [
 struct NoPwrWrite
     inner: I2cDut
 
-impl Bmp390Port for NoPwrWrite
-    fn setup(self) -> Bool [hw]
-        self.inner.setup()
-
+impl RegPort for NoPwrWrite
     fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
         self.inner.read_regs(reg, n, var dst)
 
@@ -810,6 +809,10 @@ impl Bmp390Port for NoPwrWrite
         if reg == 0x1B
             return false
         self.inner.write_reg(reg, v)
+
+impl Bmp390Port for NoPwrWrite
+    fn setup(self) -> Bool [hw]
+        self.inner.setup()
 
     fn irq_level(self) -> Int [hw]
         self.inner.irq_level()
@@ -989,10 +992,7 @@ fn test_a_part_that_refuses_the_soft_reset_ends_the_bring_up() [io, hw]
 struct FailCmd
     inner: I2cDut
 
-impl Bmp390Port for FailCmd
-    fn setup(self) -> Bool [hw]
-        self.inner.setup()
-
+impl RegPort for FailCmd
     fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
         self.inner.read_regs(reg, n, var dst)
 
@@ -1000,6 +1000,10 @@ impl Bmp390Port for FailCmd
         if reg == 0x7E
             return false
         self.inner.write_reg(reg, v)
+
+impl Bmp390Port for FailCmd
+    fn setup(self) -> Bool [hw]
+        self.inner.setup()
 
     fn irq_level(self) -> Int [hw]
         self.inner.irq_level()
@@ -1016,10 +1020,7 @@ fn test_a_fatal_error_after_the_reset_ends_the_bring_up() [io, hw]
 struct ErrAfterReset
     inner: I2cDut
 
-impl Bmp390Port for ErrAfterReset
-    fn setup(self) -> Bool [hw]
-        self.inner.setup()
-
+impl RegPort for ErrAfterReset
     fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
         self.inner.read_regs(reg, n, var dst)
 
@@ -1028,6 +1029,10 @@ impl Bmp390Port for ErrAfterReset
         if reg == 0x7E
             self.inner.bus.c.regs.insert(0x02, 0x01)
         ok
+
+impl Bmp390Port for ErrAfterReset
+    fn setup(self) -> Bool [hw]
+        self.inner.setup()
 
     fn irq_level(self) -> Int [hw]
         self.inner.irq_level()
@@ -1054,10 +1059,7 @@ fn test_a_part_whose_calibration_cannot_be_read_fails_the_bring_up() [io, hw]
 struct NoCal
     inner: I2cDut
 
-impl Bmp390Port for NoCal
-    fn setup(self) -> Bool [hw]
-        self.inner.setup()
-
+impl RegPort for NoCal
     fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
         if reg == 0x31
             dst.clear()
@@ -1066,6 +1068,10 @@ impl Bmp390Port for NoCal
 
     fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
         self.inner.write_reg(reg, v)
+
+impl Bmp390Port for NoCal
+    fn setup(self) -> Bool [hw]
+        self.inner.setup()
 
     fn irq_level(self) -> Int [hw]
         self.inner.irq_level()
@@ -1175,3 +1181,12 @@ fn test_the_spi_type_over_absent_hardware() [io, hw]
     test.assert_eq(p.temp_start(), -1)
     test.assert(p.temp_read() == None)
     test.assert(p.device_id() == None)
+
+// ── The functions that the register methods replace ──────────────────
+
+@test
+fn test_the_deprecated_register_functions_answer_as_the_methods_do() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert_eq(bmp390.reg_read(d, 0x00), d.read_reg(0x00))
+    test.assert_eq(bmp390.reg_write(d, 0x00, 0x01), d.write_reg_verified(0x00, 0x01))

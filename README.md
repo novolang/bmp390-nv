@@ -182,7 +182,7 @@ An SPI read clocks one dummy byte in after the control byte (section
 
 | Module | What is in it |
 |---|---|
-| `bmp390` | The types `Bmp390` (I2C) and `Bmp390Spi` (SPI), `Bmp390Cal` and `Bmp390Sample`, the trait `Bmp390Port`, the bus framing, the register access, the compensation, the settings and the bring-up |
+| `bmp390` | The types `Bmp390` (I2C) and `Bmp390Spi` (SPI), `Bmp390Cal` and `Bmp390Sample`, the trait `Bmp390Port` over devices-nv's `RegPort`, the bus framing, the register access, the compensation, the settings and the bring-up |
 
 ## How to choose an entry point
 
@@ -215,7 +215,7 @@ coefficients once.  It answers `false` for a part that does not answer
 answers 0x50 and is not accepted.
 
 A program that holds its own bus, or a test with a double of the part,
-implements `Bmp390Port` over its bus and calls the module's functions,
+implements devices-nv's `RegPort` (`read_regs` and `write_reg`; the register reads and read-modify-writes, `port.read_reg(reg)` and `port.update_reg_verified(reg, mask, bits)`, are its methods) and `Bmp390Port` over its bus and calls the module's functions,
 which take the port: `bmp390.sample_read(port)`, `bmp390.start(port)`.
 The framing of each bus is `i2c_read_into`, `i2c_write`, `spi_read_into`
 and `spi_write`, generic over `I2cBus` and `SpiBus`.  The compensation
